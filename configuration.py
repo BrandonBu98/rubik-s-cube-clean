@@ -4,13 +4,13 @@ import cv2
 import numpy as np
 import math
 from ultralytics import YOLO
-from shapely.geometry import Polygon
+# from shapely.geometry import Polygon
 from PIL import Image, ImageDraw
 from IPython.display import display
-from tabulate import tabulate
+# from tabulate import tabulate
 from collections import defaultdict
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
+# from sklearn.cluster import KMeans
+# from sklearn.decomposition import PCA
 from scipy.spatial import ConvexHull
 
 
@@ -71,6 +71,14 @@ corner_mapping = {
         ("green", "red"): 6
     }
 }
+COLOR_MAP = {
+    "white":   (255, 255, 255),
+    "yellow":  (0, 255, 255),
+    "blue":    (255, 0, 0),
+    "green":   (0, 128, 0),
+    "red":     (0, 0, 255),
+    "orange":  (0, 165, 255)
+}
 
 class CubeState:
     # face_id: center sticker color
@@ -79,12 +87,22 @@ class CubeState:
     def __init__(self):
         self.faces = {}
         self.confidence_threshold = 0.8
-        self.net = {}
+        self.finalization_log = []
+        self.net = {
+            "white": None,
+            "yellow": None,
+            "blue": None,
+            "green": None,
+            "red": None,
+            "orange": None
+            }
     
     def check_face(self, face_id, center, perimeter):
+        # if self.faces[face_id]['finalized'] == True:
+        #     return 
         ring = update_ring(center, perimeter)
         trust = True
-        if face_id not in self.faces:
+        if face_id not in self.faces: # new face detected
             self.faces[face_id] = {
                 'center': center,
                 'ring': ring,
@@ -99,32 +117,28 @@ class CubeState:
         else: # this face has been detected before
             stored_face = self.faces[face_id]
             similarity = compute_face_similarity(stored_face['ring'], ring)
-            if self.faces[face_id]['ring_finalized'] == True:
-                if similarity >= 0.9:
-                    stored_face['confidence'] = min(1.0, stored_face['confidence'] + 0.1)
-                    stored_face['stability'] += 1
-                print(f"Face {face_id} is finalized, skip")
+            if similarity >= 0.9:
+                stored_face['confidence'] = min(1.0, stored_face['confidence'] + 0.1)
+                stored_face['stability'] += 1
+                stored_face['ring'] = ring
+                stored_face['center'] = center
+                # print(f"confidence added FACE {face_id} with {stored_face['confidence']} and {stored_face['stability']}")
+                # print(", ".join(class_names.get(sticker['class_id'], "Unknown") for sticker in ring))
             else:
-                if similarity >= 0.8:
-                    stored_face['confidence'] = min(1.0, stored_face['confidence'] + 0.1)
-                    stored_face['stability'] += 1
-                    stored_face['ring'] = ring
-                    stored_face['center'] = center
-                    # print(f"confidence added FACE {face_id} with {stored_face['confidence']} and {stored_face['stability']}")
-                    # print(", ".join(class_names.get(sticker['class_id'], "Unknown") for sticker in ring))
-                else:
-                    stored_face['stability'] = max(0, stored_face['stability'] - 1)
-                    stored_face['confidence'] = max(0.0, stored_face['confidence'] - 0.05)
-                    trust = False
-                    # print(f"confidence lowered FACE {face_id} with {stored_face['confidence']} and {stored_face['stability']}")
-                    # print(", ".join(class_names.get(sticker['class_id'], "Unknown") for sticker in ring))
-                if stored_face['confidence'] < 0.1:
-                    stored_face['ring'] = ring
-                    stored_face['center'] = center
-                    stored_face['confidence'] = 0.3
-                    stored_face['stability'] = 0
-                    # print(f"confidence reset FACE {face_id}")
-                    # print(", ".join(class_names.get(sticker['class_id'], "Unknown") for sticker in ring))
+                stored_face['stability'] = max(0, stored_face['stability'] - 1)
+                stored_face['confidence'] = max(0.0, stored_face['confidence'] - 0.05)
+                trust = False
+                print(f"confident of face {face_id} is low: {stored_face['confidence']}, stability: {stored_face['stability']}")
+                # print(f"confidence lowered FACE {face_id} with {stored_face['confidence']} and {stored_face['stability']}")
+                # print(", ".join(class_names.get(sticker['class_id'], "Unknown") for sticker in ring))
+            if stored_face['confidence'] < 0.1:
+                stored_face['ring'] = ring
+                stored_face['center'] = center
+                stored_face['confidence'] = 0.3
+                stored_face['stability'] = 0
+                # print(f"confidence reset FACE {face_id}")
+                # print(", ".join(class_names.get(sticker['class_id'], "Unknown") for sticker in ring))
+        self.update_visual_state_from_ring(face_id)
         return trust
 
     def update_face(self, grouped_faces, frame):
@@ -134,18 +148,24 @@ class CubeState:
         face_id1 = classify_center_color(frame, center1['bbox'])
         face_id2 = classify_center_color(frame, center2['bbox'])
         if (face_id1 not in FACE_NEIGHBORS[face_id2]):
-            print("Two faces are the same, skip")
+            print("Two faces are not neighbors, skip")
             return
         perimeter1 = face1[1:]
+        perimeter1 = update_ring(center1, perimeter1)
         perimeter2 = face2[1:]
+        perimeter2 = update_ring(center2, perimeter2)
         conf1 = self.check_face(face_id1, center1, perimeter1)
         conf2 = self.check_face(face_id2, center2, perimeter2)
         
         if conf1 and conf2:
+            print(f"[UNIFY] Ring trust high for {face_id1} and {face_id2} → proceeding with unify_edge")
             self.unify_edge(face_id1, face_id2, center1, center2, perimeter1, perimeter2)
+        else:
+            print(f"[SKIP] Skipped unify_edge due to low ring trust. trust1={conf1}, trust2={conf2}")
+
 
     def unify_edge(self, c1, c2, center1, center2, ring1, ring2):
-        if (self.faces[c1]['confidence'] < 0.8) or (self.faces[c2]['confidence'] < 0.8) or (self.faces[c1]['stability'] < 5) or (self.faces[c2]['stability'] < 5):
+        if (self.faces[c1]['confidence'] < 0.5) or (self.faces[c2]['confidence'] < 0.5) or (self.faces[c1]['stability'] < 3) or (self.faces[c2]['stability'] < 3):
             print("No enough confidence or stability to unify edge")
             return
 
@@ -158,124 +178,189 @@ class CubeState:
             directionc1c2 = (dx / magnitude, dy / magnitude)
         directionc2c1 = (-directionc1c2[0], -directionc1c2[1])
 
-        best_score = -float('inf')
-        best_triple_idx = None 
-        best_triple = None
-        for i in range(8):
-            i2 = (i + 1) % 8
-            i3 = (i + 2) % 8
-            triplet = ring1[i], ring1[i2], ring1[i3]
-            align_score = self.score_triplet(triplet, directionc1c2, center1)
-            dis_score = -self.average_distance(triplet, center2)
-            score = align_score*0.4 + dis_score*0.6
-            print(f"Triplet {triplet} of face {c1} to face {c2}- Align Score: {align_score:.3f} - dis Score: {dis_score:.3f} and final score: {score:.3f}")
-            if score > best_score:
-                best_score = score
-                best_triple_idx = (i, i2, i3)
-                best_triple = triplet
-        print(f"Best triplet for face {c1} to face {c2} is {best_triple} with score {best_score:.3f}")
-        
+        if self.faces[c1]['finalized'] == True:
+            print(f"Face {c1} is already finalized, skip")
+            return
+        else:
+            best_score = -float('inf')
+            best_triple_idx = None 
+            best_triple = None
+            for i in range(8):
+                i2 = (i + 1) % 8
+                i3 = (i + 2) % 8
+                triplet = ring1[i], ring1[i2], ring1[i3]
+                align_score = self.score_triplet(triplet, directionc1c2, center1)
+                dis_score = -self.average_distance(triplet, center2)
+                score = dis_score # align_score*0.4 + dis_score*0.6
+                # print(f"Triplet {triplet} of face {c1} to face {c2}- Align Score: {align_score:.3f} - dis Score: {dis_score:.3f} and final score: {score:.3f}")
+                if score > best_score:
+                    best_score = score
+                    best_triple_idx = (i, i2, i3)
+                    best_triple = triplet
+            triplet_colors = tuple(class_names.get(sticker['class_id'], 'Unknown') for sticker in best_triple)
+            print(f"Best triplet for face {c1} to face {c2} is {triplet_colors} with score {best_score:.3f}")
+            
+            print(f"Before checking ring_finalized for {c1}")
+            print(f"Ring for {c1}: {[class_names.get(sticker['class_id'], 'Unknown') for sticker in self.faces[c1]['ring']]}")
+            if self.faces[c1]['finalized'] == True:
+                idx = self.get_ring_idx(best_triple, self.faces[c1]['ring'])
+                print(f"Ring index for best_triple in {c1}: {idx}")
+                if idx is None:
+                    return
+                else:
+                    best_triple_idx = idx
+            print(f"After checking ring_finalized for {c1} and {c2}")
+            print(f"Best triple index for {c1}: {best_triple_idx}")
+            # self.faces[c1]['ring_finalized'] = True
+
+            # Build and store matrix for face c1
+            matrix_c1, rotated = self.build_final_matrix_from_ring(
+                ring=self.faces[c1]['ring'],
+                edge_idx=best_triple_idx,
+                face_id=c1,
+                neighbor_id=c2
+            )
+            if matrix_c1:
+                self.net[c1] = matrix_c1
+                self.faces[c1]['finalized'] = True
+                ring_colors = [class_names.get(st['class_id'], 'Unknown') for st in self.faces[c1]['ring']]
+                triple_colors = [class_names.get(st['class_id'], 'Unknown') for st in best_triple]
+                self.finalization_log.append((c1, c2, ring_colors, triple_colors, best_triple_idx, rotated))
+
         
         # do the opposite on c2
-        best_dist2 = -float('inf')
-        best_triple_idx2 = None
-        best_triple2 = None
-        for i in range(8):
-            i2 = (i + 1) % 8
-            i3 = (i + 2) % 8
-            triplet = ring2[i], ring2[i2], ring2[i3]
-            align_score = self.score_triplet(triplet, directionc2c1, center2)
-            dis_score = -self.average_distance(triplet, center1)
-            score = align_score*0.4 + dis_score*0.6
-            print(f"Triplet {triplet} of face {c2} to face {c1}- Align Score: {align_score:.3f} - dis Score: {dis_score:.3f} and final score: {score:.3f}")
-            if score > best_dist2:
-                best_dist2 = score
-                best_triple_idx2 = (i, i2, i3)
-                best_triple2 = triplet
-        print(f"Best triplet for face {c2} to face {c1} is {best_triple2} with score {best_dist2:.3f}")
+        if self.faces[c2]['finalized'] == True:
+            print(f"Face {c2} is already finalized, skip")
+            return
+        else:
 
-        # if face ring is finalized, find the correspond indexing of the triple
-        print(f"Before checking ring_finalized for {c1} and {c2}")
-        print(f"Ring for {c1}: {[class_names.get(sticker['class_id'], 'Unknown') for sticker in self.faces[c1]['ring']]}")
-        print(f"Ring for {c2}: {[class_names.get(sticker['class_id'], 'Unknown') for sticker in self.faces[c2]['ring']]}")
-
-        if self.faces[c1]['ring_finalized'] == True:
-            idx = self.get_ring_idx(best_triple, self.faces[c1]['ring'])
-            print(f"Ring index for best_triple in {c1}: {idx}")
-            if idx is None:
-                return
-            else:
-                best_triple_idx = idx
+            best_dist2 = -float('inf')
+            best_triple_idx2 = None
+            best_triple2 = None
+            for i in range(8):
+                i2 = (i + 1) % 8
+                i3 = (i + 2) % 8
+                triplet = ring2[i], ring2[i2], ring2[i3]
+                # align_score = self.score_triplet(triplet, directionc2c1, center2)
+                dis_score = -self.average_distance(triplet, center1)
+                # score = align_score*0.4 + dis_score*0.6
+                score = dis_score
+                # print(f"Triplet {triplet} of face {c2} to face {c1}- Align Score: {align_score:.3f} - dis Score: {dis_score:.3f} and final score: {score:.3f}")
+                if score > best_dist2:
+                    best_dist2 = score
+                    best_triple_idx2 = (i, i2, i3)
+                    best_triple2 = triplet
+            triplet_colors = tuple(class_names.get(sticker['class_id'], 'Unknown') for sticker in best_triple2)
+            print(f"Best triplet for face {c2} to face {c1} is {triplet_colors} with score {best_score:.3f}")
+            # if face ring is finalized, find the correspond indexing of the triple
+            print(f"Before checking ring_finalized for {c2}")
+            print(f"Ring for {c2}: {[class_names.get(sticker['class_id'], 'Unknown') for sticker in self.faces[c2]['ring']]}")
             
-        if self.faces[c2]['ring_finalized'] == True:
-            idx = self.get_ring_idx(best_triple2, self.faces[c2]['ring'])
-            print(f"Ring index for best_triple2 in {c2}: {idx}")
-            if idx is None:
-                return
-            else:
-                best_triple_idx2 = idx
-        print(f"After checking ring_finalized for {c1} and {c2}")
-        print(f"Best triple index for {c1}: {best_triple_idx}")
-        print(f"Best triple index for {c2}: {best_triple_idx2}")
+            if self.faces[c2]['finalized'] == True:
+                idx = self.get_ring_idx(best_triple2, self.faces[c2]['ring'])
+                print(f"Ring index for best_triple2 in {c2}: {idx}")
+                if idx is None:
+                    return
+                else:
+                    best_triple_idx2 = idx
+            print(f"After checking ring_finalized for {c1} and {c2}")
+            print(f"Best triple index for {c2}: {best_triple_idx2}")
+            # self.faces[c2]['ring_finalized'] = True
 
-        self.faces[c1]['ring_finalized'] = True
-        self.faces[c2]['ring_finalized'] = True
+            # Build and store matrix for face c2
+            matrix_c2, rotated2 = self.build_final_matrix_from_ring(
+                ring=self.faces[c2]['ring'],
+                edge_idx=best_triple_idx2,
+                face_id=c2,
+                neighbor_id=c1
+            )
+            if matrix_c2:
+                self.net[c2] = matrix_c2
+                self.faces[c2]['finalized'] = True
+                ring_colors = [class_names.get(st['class_id'], 'Unknown') for st in self.faces[c2]['ring']]
+                triple_colors = [class_names.get(st['class_id'], 'Unknown') for st in best_triple2]
+                self.finalization_log.append((c2, c1, ring_colors, triple_colors, best_triple_idx2, rotated2))
 
-        prev_edge1 = self.faces[c1]['neighbors'][c2]
-        if prev_edge1:
-            prev_triple = prev_edge1['my_triple']
-            if prev_triple == best_triple or prev_triple == [best_triple[2], best_triple[1], best_triple[0]]:
-                self.faces[c1]['neighbors'][c2]['confidence'] = min(1.0, prev_edge1['confidence'] + 0.1)
-            else:
-                self.faces[c1]['neighbors'][c2]['confidence'] = min(1.0, prev_edge1['confidence'] - 0.1)
-            if self.faces[c1]['neighbors'][c2]['confidence'] < 0.2:
-                print(f"Face {c1} with neighbor {c2} confidence reset")
-                self.faces[c1]['neighbors'][c2] = {
-                'my_triple_idx': best_triple_idx,
-                'my_triple': best_triple,
-                'their_triple_idx': best_triple_idx2,
-                'their_triple': best_triple2,
-                'confidence': 0.3
-            }
-        else: # new edge, initialize confidence
-            print(f"[DEBUG] Face {c1} added edges:{[class_names.get(sticker['class_id'], 'Unknown') for sticker in best_triple]} with face {c2}")
-            self.faces[c1]['neighbors'][c2] = {
-                'my_triple_idx': best_triple_idx,
-                'my_triple': best_triple,
-                'their_triple_idx': best_triple_idx2,
-                'their_triple': best_triple2,
-                'confidence': 0.3
-            }
-            
-        prev_edge2 = self.faces[c2]['neighbors'][c1]
-        if prev_edge2:
-            prev_triple = prev_edge2['my_triple']
-            if prev_triple == best_triple2 or prev_triple == [best_triple2[2], best_triple2[1], best_triple2[0]]:
-                self.faces[c2]['neighbors'][c1]['confidence'] = min(1.0, prev_edge2['confidence'] + 0.1)
-            else:
-                self.faces[c2]['neighbors'][c1]['confidence'] = min(1.0, prev_edge2['confidence'] - 0.1)
-            # if self.faces[c2]['neighbors'][c1]['confidence'] < 0.2:
-            #     print(f"Face {c2} with neighbor {c1} confidence reset")
-            #     self.faces[c2]['neighbors'][c1] = {
-            #     'my_triple_idx': best_triple_idx2,
-            #     'my_triple': best_triple2,
-            #     'their_triple_idx': best_triple_idx,
-            #     'their_triple': best_triple,
-            #     'confidence': 0.3
-            # }
-        else: # new edge, initialize confidence
-            print(f"[DEBUG] Face {c2} added edges:{[class_names.get(sticker['class_id'], 'Unknown') for sticker in best_triple2]} with face {c1}")
-            self.faces[c2]['neighbors'][c1] = {
-                'my_triple_idx': best_triple_idx2,
-                'my_triple': best_triple2,
-                'their_triple_idx': best_triple_idx,
-                'their_triple': best_triple,
-                'confidence': 0.3
-            }
+    def build_final_matrix_from_ring(self, ring, edge_idx, face_id, neighbor_id):
+        
+        # Builds a 3x3 matrix for face_id using a clockwise-ordered ring and its neighbor alignment.
+        
+        # edge_idx: (i, i+1, i+2) indices of shared triple in the ring
+        # face_id:  color string of this face (e.g. "blue")
+        # neighbor_id: color string of the neighbor face (e.g. "white")
+        
 
+        # Map face → neighbor → position of neighbor edge on this face
+        # Format: face -> { neighbor -> "top"/"bottom"/"left"/"right" }
+        FACE_EDGE_MAP = {
+            "blue":   {"white": "top", "yellow": "bottom", "red": "left", "orange": "right"},
+            "red":    {"white": "top", "yellow": "bottom", "green": "left", "blue": "right"},
+            "orange": {"white": "top", "yellow": "bottom", "blue": "left", "green": "right"},
+            "green":  {"white": "top", "yellow": "bottom", "orange": "left", "red": "right"},
+            "white":  {"green": "top", "red": "left", "blue": "bottom", "orange": "right"},
+            "yellow": {"blue": "top", "red": "left", "green": "bottom", "orange": "right"},
+        }
 
-        self.check_finalize(c1)
-        self.check_finalize(c2)
+        # Get color labels from ring
+        class_ids = [sticker['class_id'] for sticker in ring]
+        colors = [class_names.get(cid, "X") for cid in class_ids]
+
+        matrix = [["X" for _ in range(3)] for _ in range(3)]
+        matrix[1][1] = face_id  # Center sticker is always known
+
+        # Rotate ring so edge_idx[0] becomes index 0
+        start = edge_idx[0]
+        rotated = colors[start:] + colors[:start]
+
+        # Determine which edge this triple is (top/left/etc.)
+        edge_position = FACE_EDGE_MAP.get(face_id, {}).get(neighbor_id, None)
+        if edge_position is None:
+            print(f"[WARNING] No edge direction found for {face_id} with neighbor {neighbor_id}")
+            return None
+
+        # Fill in matrix based on orientation
+        if edge_position == "top":
+            matrix[0][0] = rotated[0]
+            matrix[0][1] = rotated[1]
+            matrix[0][2] = rotated[2]
+            matrix[1][2] = rotated[3]
+            matrix[2][2] = rotated[4]
+            matrix[2][1] = rotated[5]
+            matrix[2][0] = rotated[6]
+            matrix[1][0] = rotated[7]
+
+        elif edge_position == "bottom":
+            matrix[2][2] = rotated[0]
+            matrix[2][1] = rotated[1]
+            matrix[2][0] = rotated[2]
+            matrix[1][0] = rotated[3]
+            matrix[0][0] = rotated[4]
+            matrix[0][1] = rotated[5]
+            matrix[0][2] = rotated[6]
+            matrix[1][2] = rotated[7]
+
+        elif edge_position == "left":
+            matrix[2][0] = rotated[0]
+            matrix[1][0] = rotated[1]
+            matrix[0][0] = rotated[2]
+            matrix[0][1] = rotated[3]
+            matrix[0][2] = rotated[4]
+            matrix[1][2] = rotated[5]
+            matrix[2][2] = rotated[6]
+            matrix[2][1] = rotated[7]
+
+        elif edge_position == "right":
+            matrix[0][2] = rotated[0]
+            matrix[1][2] = rotated[1]
+            matrix[2][2] = rotated[2]
+            matrix[2][1] = rotated[3]
+            matrix[2][0] = rotated[4]
+            matrix[1][0] = rotated[5]
+            matrix[0][0] = rotated[6]
+            matrix[0][1] = rotated[7]
+
+        return matrix, rotated
+
 
     def check_finalize(self, face):
         if face not in self.faces or self.faces[face]['finalized'] == True:
@@ -395,6 +480,31 @@ class CubeState:
 
         return matrix
 
+    def update_visual_state_from_ring(self, face_id):
+        # print(f"[DEBUG] Called update_visual_state_from_ring for {face_id}")
+        if self.faces[face_id]['finalized'] == True:
+            return
+        ring = self.faces[face_id]['ring']
+        if not ring:
+            print(f"ring is empty for face {face_id}")
+            return
+        if ring and len(ring) != 8:
+            print("ring length not 8")
+            return
+        if ring and len(ring) == 8:
+            matrix = [["X" for _ in range(3)] for _ in range(3)]
+            matrix[1][1] = face_id  # center
+            # Fill known positions based on ring index (simplified for illustration)
+            matrix[0][0] = class_names.get(ring[0]['class_id'], 'X')
+            matrix[0][1] = class_names.get(ring[1]['class_id'], 'X')
+            matrix[0][2] = class_names.get(ring[2]['class_id'], 'X')
+            matrix[1][2] = class_names.get(ring[3]['class_id'], 'X')
+            matrix[2][2] = class_names.get(ring[4]['class_id'], 'X')
+            matrix[2][1] = class_names.get(ring[5]['class_id'], 'X')
+            matrix[2][0] = class_names.get(ring[6]['class_id'], 'X')
+            matrix[1][0] = class_names.get(ring[7]['class_id'], 'X')
+            self.net[face_id] = matrix
+
     def score_triplet(self, triplet, direction, center):
         cx = np.mean([st['cx'] for st in triplet])
         cy = np.mean([st['cy'] for st in triplet])
@@ -431,8 +541,9 @@ class CubeState:
             dy = sticker['cy'] - center['cy']
             total_dist += np.hypot(dx, dy)
         ave_dist = total_dist
-        normalize_dist = (ave_dist - 10) / (900 - 10)
-        return 1 - normalize_dist
+        return ave_dist
+        # normalize_dist = (ave_dist - 10) / (900 - 10)
+        # return 1 - normalize_dist
     
     def get_ring_idx(self, triple, ring):
         triple_colors = [class_names[sticker['class_id']] for sticker in triple]
@@ -574,7 +685,7 @@ def classify_center_color(frame, bbox):
     best_color = max(color_counts, key=color_counts.get)
     return best_color
 
-def draw_cube_net_image(face_data):
+def draw_cube_net_image(face_data, faces=None):
     """
     face_data: a dict with 3x3 arrays for each of these keys:
        "White", "Yellow", "Blue", "Green", "Red", "Orange"
@@ -587,7 +698,7 @@ def draw_cube_net_image(face_data):
               [Yellow]
     """
 
-    square_size = 30
+    square_size = 80
     face_width  = 3 * square_size
     face_height = 3 * square_size
 
@@ -650,8 +761,56 @@ def draw_cube_net_image(face_data):
 
     # Yellow face: x=face_width (90), y=2*face_width (180)
     draw_face("yellow", face_width, 2*face_width)
+    if faces is not None:
+        all_faces = ["white", "yellow", "blue", "green", "red", "orange"]
+        unfinalized = []
 
+        for name in all_faces:
+            # Show face if not finalized or not yet detected
+            if name not in faces or not faces[name].get('finalized', False):
+                unfinalized.append(name.capitalize())
+
+        if unfinalized:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            color = (0, 0, 255)  # Red
+            thickness = 2
+            line_height = 35  # spacing between lines
+            x, y = 10, 30     # starting position
+
+            # Split into chunks of 3
+            for i in range(0, len(unfinalized), 3):
+                chunk = unfinalized[i:i+3]
+                label = "Unfinalized: " + ", ".join(chunk) if i == 0 else "             " + ", ".join(chunk)
+                cv2.putText(net_img, label, (x, y + i * line_height), font, font_scale, color, thickness, cv2.LINE_AA)
     return net_img
+
+def overlay(annotated_frame, net_img, scale = 0.5):
+    combined = annotated_frame.copy()
+    
+    # 2) Resize the net image
+    net_h, net_w = net_img.shape[:2]
+    new_w = int(net_w * scale)
+    new_h = int(net_h * scale)
+    net_resized = cv2.resize(net_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # 3) Compute the bottom-right corner coordinates
+    h, w = combined.shape[:2]
+    x_start = w - new_w
+    y_start = h - new_h
+    
+    # 4) If the net is bigger than the frame in either dimension, handle partial or skip
+    if x_start < 0 or y_start < 0:
+        # net is too large for the given scale to fit in bottom-right
+        # Optionally just place it at (0,0), or skip
+        x_start = max(x_start, 0)
+        y_start = max(y_start, 0)
+    
+    # 5) Overlay
+    roi = combined[y_start:y_start+new_h, x_start:x_start+new_w]
+    roi[:] = net_resized
+    
+    return combined
 
 def update_ring(center, perimeter):
 
@@ -678,11 +837,15 @@ def main():
         "orange": None
     }
     cube_state = CubeState()
-    cap = cv2.VideoCapture(0)  # Use 0 if DroidCam is set as the default webcam
+    cap = cv2.VideoCapture(1)  # Use 0 if DroidCam is set as the default webcam
     if not cap.isOpened():
         print("Error: Could not open webcam.")
         return
-    
+    frame_width = int(cap.get(3))
+    frame_height = int(cap.get(4))
+    fps = 30
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'XVID'
+    out = cv2.VideoWriter('rubik_process.mp4', fourcc, fps, (frame_width, frame_height))
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -690,7 +853,7 @@ def main():
             break
         
         # YOLO detection
-        results = yolo_model.predict(source=frame, conf=0.5, save=False, verbose=False)
+        results = yolo_model.predict(source=frame, conf=0.55, save=False, verbose=False)
         centers = []
         normal_stickers = []
 
@@ -815,13 +978,15 @@ def main():
                 label_str = f"cls={cls_id}"
                 cv2.putText(frame, label_str, (x1, y1-5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, rect_color, 2)
-
-        cv2.imshow("Detection", frame)
+        net_img = draw_cube_net_image(cube_state.net, cube_state.faces)
+        combined_frame = overlay(frame.copy(), net_img)
+        cv2.imshow("Detection", combined_frame)
+        out.write(combined_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
     print("------Final cube state------")
     for face, data in cube_state.faces.items():
-            print(f"Face {face}: Confidence: {data['confidence']:.2f}, Stability: {data['stability']}, Ring Finalized: {data['ring_finalized']}")
+            print(f"Face {face}: Confidence: {data['confidence']:.2f}, Stability: {data['stability']}, Finalized: {data['finalized']}")
             ring_colors = ", ".join(class_names.get(sticker['class_id'], "Unknown") for sticker in data['ring'])
             print(f"Ring: {ring_colors}")
             for neighbor, edge in data['neighbors'].items():
@@ -830,7 +995,9 @@ def main():
                     print(", ".join(class_names.get(sticker['class_id'], "Unknown") for sticker in edge['my_triple']))
             print() 
     print(f"Final net is: {cube_state.net}")
+    print(f"Final Log is: {cube_state.finalization_log}")
     cap.release()
+    out.release()
     cv2.destroyAllWindows()
 
 if __name__ == '__main__':
